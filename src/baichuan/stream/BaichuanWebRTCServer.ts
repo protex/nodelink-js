@@ -248,6 +248,16 @@ export class BaichuanWebRTCServer extends EventEmitter {
   private sessionIdCounter = 0;
   private weriftModule: any = null;
 
+  /**
+   * One native Preview stream is shared by every WebRTC peer on this server.
+   * A second createNativeStream for the same channel/profile gets response_code
+   * 430 from the camera, so multi-viewer (phone + desktop) must fan-out frames
+   * from a single generator instead of opening N dedicated previews.
+   */
+  private sharedNativeStream: AsyncGenerator<any, void, unknown> | null = null;
+  private sharedPumpPromise: Promise<void> | null = null;
+  private sharedPumpRunning = false;
+
   constructor(options: BaichuanWebRTCServerOptions) {
     super();
     this.options = options;
@@ -577,6 +587,11 @@ export class BaichuanWebRTCServer extends EventEmitter {
       "info",
       `WebRTC session ${sessionId} closed (active sessions: ${this.sessions.size})`,
     );
+
+    // Last viewer leaves → release the shared camera Preview.
+    if (this.sessions.size === 0) {
+      await this.stopSharedNativeStream();
+    }
   }
 
   /**
@@ -613,6 +628,7 @@ export class BaichuanWebRTCServer extends EventEmitter {
     this.log("info", "Stopping WebRTC server");
     const sessionIds = Array.from(this.sessions.keys());
     await Promise.all(sessionIds.map((id) => this.closeSession(id)));
+    await this.stopSharedNativeStream();
     this.log("info", "WebRTC server stopped");
   }
 
@@ -648,204 +664,253 @@ export class BaichuanWebRTCServer extends EventEmitter {
   }
 
   /**
-   * Start native Baichuan stream and pump frames to WebRTC
+   * Attach a session to the shared native Preview and ensure the fan-out pump
+   * is running. Multiple WebRTC peers share one createNativeStream so the
+   * camera does not reject a second Preview (response_code 430).
    */
   private async startNativeStream(session: WebRTCSession): Promise<void> {
     this.log(
       "info",
-      `Starting native stream for session ${session.id} (channel=${this.options.channel}, profile=${this.options.profile})`,
+      `Starting native stream for session ${session.id} (channel=${this.options.channel}, profile=${this.options.profile}, shared=${this.sharedPumpRunning}, peers=${this.sessions.size})`,
     );
 
-    // Create native stream generator
-    // createNativeStream automatically acquires a dedicated socket from the pool.
-    session.nativeStream = createNativeStream(
-      this.options.api,
-      this.options.channel,
-      this.options.profile,
-      this.options.variant !== undefined
-        ? { variant: this.options.variant }
-        : undefined,
-    );
+    // Per-session RTP state (each peer needs independent seq/ts/transcoder).
+    (session as any)._rtpSequence = Math.floor(Math.random() * 65535);
+    (session as any)._rtpTimestamp = Math.floor(Math.random() * 0xffffffff);
+    (session as any)._lastTimeMicros = 0;
+    (session as any)._frameNumber = 0;
+    (session as any)._packetsSentSinceLastLog = 0;
+    (session as any)._lastLogTime = Date.now();
 
-    // Pump frames to WebRTC
-    this.pumpFramesToWebRTC(session).catch((err) => {
-      this.log("error", `Frame pump error for session ${session.id}: ${err}`);
-      this.closeSession(session.id).catch(() => {});
-    });
+    if (!this.sharedPumpRunning) {
+      this.sharedNativeStream = createNativeStream(
+        this.options.api,
+        this.options.channel,
+        this.options.profile,
+        this.options.variant !== undefined
+          ? { variant: this.options.variant }
+          : undefined,
+      );
+      this.sharedPumpRunning = true;
+      this.sharedPumpPromise = this.pumpSharedNativeStream().catch((err) => {
+        this.log("error", `Shared frame pump error: ${err}`);
+        this.sharedPumpRunning = false;
+        this.sharedNativeStream = null;
+      });
+    } else {
+      this.log(
+        "info",
+        `Session ${session.id} joined existing shared native stream (peers=${this.sessions.size})`,
+      );
+    }
+  }
+
+  private async stopSharedNativeStream(): Promise<void> {
+    if (!this.sharedPumpRunning && !this.sharedNativeStream) return;
+    this.log("info", "Stopping shared native stream");
+    this.sharedPumpRunning = false;
+    const src = this.sharedNativeStream;
+    this.sharedNativeStream = null;
+    try {
+      await src?.return(undefined as any);
+    } catch {
+      // ignore generator cleanup errors
+    }
+    try {
+      await this.sharedPumpPromise;
+    } catch {
+      // ignore
+    }
+    this.sharedPumpPromise = null;
   }
 
   /**
-   * Pump frames from native stream to WebRTC tracks
-   * H.264 → RTP media track (standard WebRTC)
-   * H.265 → DataChannel with raw Annex-B frames (decoded by WebCodecs in browser)
+   * Single native-stream consumer that fans each frame out to every active
+   * WebRTC session on this server.
    */
-  private async pumpFramesToWebRTC(session: WebRTCSession): Promise<void> {
-    if (!session.nativeStream) {
-      this.log("warn", `No native stream for session ${session.id}`);
+  private async pumpSharedNativeStream(): Promise<void> {
+    if (!this.sharedNativeStream) {
+      this.log("warn", "No shared native stream to pump");
       return;
     }
 
-    this.log("info", `Starting frame pump for session ${session.id}`);
+    this.log(
+      "info",
+      `Starting shared frame pump (channel=${this.options.channel}, profile=${this.options.profile})`,
+    );
 
     const werift = await this.loadWerift();
-    const { RtpPacket, RtpHeader } = werift;
-
-    let sequenceNumber = Math.floor(Math.random() * 65535);
-    let timestamp = Math.floor(Math.random() * 0xffffffff);
-    const videoClockRate = 90000; // Standard RTP clock rate for video
-    let lastTimeMicros = 0;
-    let lastLogTime = Date.now();
-    let packetsSentSinceLastLog = 0;
-    let frameNumber = 0;
 
     try {
-      this.log("info", `Entering frame loop for session ${session.id}`);
+      for await (const frame of this.sharedNativeStream) {
+        if (!this.sharedPumpRunning) break;
 
-      for await (const frame of session.nativeStream) {
-        if (session.state === "disconnected" || session.state === "failed") {
-          this.log(
-            "debug",
-            `Session ${session.id} state is ${session.state}, breaking frame loop`,
-          );
-          break;
+        const peers = [...this.sessions.values()].filter(
+          (s) => s.state !== "disconnected" && s.state !== "failed",
+        );
+        if (peers.length === 0) {
+          // Brief idle: new answer may arrive; keep Preview warm for a moment.
+          continue;
         }
 
-        if (frame.audio) {
-          // Audio frame from the camera (AAC ADTS or ADPCM). Hand off to the
-          // ffmpeg-backed transcoder, which decodes + re-encodes to Opus and
-          // returns RTP-ready packets via the `packet` event.
-          session.stats.audioFrames++;
-          if (session.stats.audioFrames === 1) {
-            const head =
-              frame.data && frame.data.length > 0
-                ? frame.data.subarray(0, Math.min(8, frame.data.length)).toString("hex")
-                : "(empty)";
+        for (const session of peers) {
+          try {
+            await this.deliverFrameToSession(session, frame, werift);
+          } catch (err) {
             this.log(
-              "info",
-              `First audio frame for ${session.id}: codec=${frame.codec ?? "?"} bytes=${frame.data?.length ?? 0} head=${head}`,
+              "debug",
+              `deliverFrame failed for ${session.id}: ${err}`,
             );
-          }
-          if (
-            this.options.ffmpegPath !== "" &&
-            frame.data &&
-            frame.data.length > 0
-          ) {
-            // ADPCM is uncommon on the cameras we've tested — start with AAC
-            // only; ADPCM support can be added by switching the input format.
-            await this.ensureAudioTranscoder(session, werift);
-            session.audioTranscoder?.feedAac(frame.data);
-          }
-        } else {
-          // Video frame
-          if (frame.data) {
-            // Detect codec on first video frame
-            if (!session.videoCodec && frame.videoType) {
-              const detected = detectVideoCodecFromNal(frame.data);
-              session.videoCodec = (detected ?? frame.videoType) as any;
-              this.log("info", `Detected video codec: ${session.videoCodec}`);
-
-              // Send codec info to client via data channel
-              if (
-                session.videoDataChannel &&
-                session.videoDataChannel.readyState === "open"
-              ) {
-                const codecInfo = JSON.stringify({
-                  type: "codec",
-                  codec: session.videoCodec,
-                  width: frame.width || 0,
-                  height: frame.height || 0,
-                });
-                session.videoDataChannel.send(codecInfo);
-              }
-            }
-
-            // Calculate timestamp
-            if (frame.microseconds && lastTimeMicros > 0) {
-              const deltaMicros = frame.microseconds - lastTimeMicros;
-              const deltaTicks = Math.floor(
-                (deltaMicros / 1000000) * videoClockRate,
-              );
-              timestamp = (timestamp + deltaTicks) >>> 0;
-            } else {
-              timestamp = (timestamp + 3000) >>> 0; // ~33ms for 30fps
-            }
-            lastTimeMicros = frame.microseconds || 0;
-
-            if (session.videoCodec === "H264") {
-              // H.264 → send via DataChannel (WebCodecs will decode in browser)
-              // Check if connection is ready
-              const connState = session.peerConnection.connectionState;
-              const iceState = session.peerConnection.iceConnectionState;
-
-              // Accept various "connected" states - werift may use different values
-              const isConnected =
-                connState === "connected" ||
-                iceState === "connected" ||
-                iceState === "completed";
-
-              if (!isConnected) {
-                // Wait for connection, but don't block forever - drop frames until connected
-                if (frameNumber < 10) {
-                  this.log(
-                    "debug",
-                    `Waiting for connection, dropping H.264 frame ${frameNumber}`,
-                  );
-                }
-                frameNumber++;
-                continue;
-              }
-
-              // H.264 → send via RTP media track (standard WebRTC)
-              const packetsSent = await this.sendH264Frame(
-                session,
-                werift,
-                frame.data,
-                sequenceNumber,
-                timestamp,
-              );
-              sequenceNumber = (sequenceNumber + packetsSent) & 0xffff;
-              packetsSentSinceLastLog += packetsSent;
-              frameNumber++;
-              session.stats.videoFrames++;
-              session.stats.bytesSent += frame.data.length;
-            } else if (session.videoCodec === "H265") {
-              // H.265 → send via DataChannel (WebCodecs will decode in browser)
-              const sent = await this.sendVideoFrameViaDataChannel(
-                session,
-                frame,
-                frameNumber,
-                "H265",
-              );
-              if (sent) {
-                packetsSentSinceLastLog++;
-                frameNumber++;
-                session.stats.videoFrames++;
-                session.stats.bytesSent += frame.data.length;
-              }
-            }
-
-            // Log progress every 5 seconds (now includes audio frame counter
-            // so we can see whether the camera ever yields audio at all).
-            const now = Date.now();
-            if (now - lastLogTime >= 5000) {
-              this.log(
-                "debug",
-                `WebRTC session ${session.id} [${session.videoCodec}]: sent ${session.stats.videoFrames} video frames, ${packetsSentSinceLastLog} packets, ${Math.round(session.stats.bytesSent / 1024)} KB | audio frames=${session.stats.audioFrames}`,
-              );
-              lastLogTime = now;
-              packetsSentSinceLastLog = 0;
-            }
           }
         }
       }
     } catch (err) {
-      this.log(
-        "error",
-        `Error pumping frames for session ${session.id}: ${err}`,
-      );
+      this.log("error", `Shared native stream ended with error: ${err}`);
+    } finally {
+      this.sharedPumpRunning = false;
+      this.sharedNativeStream = null;
+      this.log("info", "Shared native stream ended");
+    }
+  }
+
+  /**
+   * Deliver one native frame to a single peer (H.264 RTP / H.265 DC + AAC→Opus).
+   */
+  private async deliverFrameToSession(
+    session: WebRTCSession,
+    frame: any,
+    werift: any,
+  ): Promise<void> {
+    const videoClockRate = 90000;
+
+    if (frame.audio) {
+      session.stats.audioFrames++;
+      if (session.stats.audioFrames === 1) {
+        const head =
+          frame.data && frame.data.length > 0
+            ? frame.data
+                .subarray(0, Math.min(8, frame.data.length))
+                .toString("hex")
+            : "(empty)";
+        this.log(
+          "info",
+          `First audio frame for ${session.id}: codec=${frame.codec ?? "?"} bytes=${frame.data?.length ?? 0} head=${head}`,
+        );
+      }
+      if (
+        this.options.ffmpegPath !== "" &&
+        frame.data &&
+        frame.data.length > 0
+      ) {
+        await this.ensureAudioTranscoder(session, werift);
+        session.audioTranscoder?.feedAac(frame.data);
+      }
+      return;
     }
 
-    this.log("info", `Native stream ended for session ${session.id}`);
+    if (!frame.data) return;
+
+    // Detect codec on first video frame
+    if (!session.videoCodec && frame.videoType) {
+      const detected = detectVideoCodecFromNal(frame.data);
+      session.videoCodec = (detected ?? frame.videoType) as any;
+      this.log(
+        "info",
+        `Detected video codec for ${session.id}: ${session.videoCodec}`,
+      );
+
+      if (
+        session.videoDataChannel &&
+        session.videoDataChannel.readyState === "open"
+      ) {
+        const codecInfo = JSON.stringify({
+          type: "codec",
+          codec: session.videoCodec,
+          width: frame.width || 0,
+          height: frame.height || 0,
+        });
+        session.videoDataChannel.send(codecInfo);
+      }
+    }
+
+    let sequenceNumber = (session as any)._rtpSequence ?? 0;
+    let timestamp = (session as any)._rtpTimestamp ?? 0;
+    let lastTimeMicros = (session as any)._lastTimeMicros ?? 0;
+    let frameNumber = (session as any)._frameNumber ?? 0;
+    let packetsSentSinceLastLog =
+      (session as any)._packetsSentSinceLastLog ?? 0;
+    let lastLogTime = (session as any)._lastLogTime ?? Date.now();
+
+    if (frame.microseconds && lastTimeMicros > 0) {
+      const deltaMicros = frame.microseconds - lastTimeMicros;
+      const deltaTicks = Math.floor((deltaMicros / 1000000) * videoClockRate);
+      timestamp = (timestamp + deltaTicks) >>> 0;
+    } else {
+      timestamp = (timestamp + 3000) >>> 0;
+    }
+    lastTimeMicros = frame.microseconds || 0;
+
+    if (session.videoCodec === "H264") {
+      const connState = session.peerConnection.connectionState;
+      const iceState = session.peerConnection.iceConnectionState;
+      const isConnected =
+        connState === "connected" ||
+        iceState === "connected" ||
+        iceState === "completed";
+
+      if (!isConnected) {
+        if (frameNumber < 10) {
+          this.log(
+            "debug",
+            `Waiting for connection, dropping H.264 frame ${frameNumber} for ${session.id}`,
+          );
+        }
+        frameNumber++;
+      } else {
+        const packetsSent = await this.sendH264Frame(
+          session,
+          werift,
+          frame.data,
+          sequenceNumber,
+          timestamp,
+        );
+        sequenceNumber = (sequenceNumber + packetsSent) & 0xffff;
+        packetsSentSinceLastLog += packetsSent;
+        frameNumber++;
+        session.stats.videoFrames++;
+        session.stats.bytesSent += frame.data.length;
+      }
+    } else if (session.videoCodec === "H265") {
+      const sent = await this.sendVideoFrameViaDataChannel(
+        session,
+        frame,
+        frameNumber,
+        "H265",
+      );
+      if (sent) {
+        packetsSentSinceLastLog++;
+        frameNumber++;
+        session.stats.videoFrames++;
+        session.stats.bytesSent += frame.data.length;
+      }
+    }
+
+    const now = Date.now();
+    if (now - lastLogTime >= 5000) {
+      this.log(
+        "debug",
+        `WebRTC session ${session.id} [${session.videoCodec}]: sent ${session.stats.videoFrames} video frames, ${packetsSentSinceLastLog} packets, ${Math.round(session.stats.bytesSent / 1024)} KB | audio frames=${session.stats.audioFrames}`,
+      );
+      lastLogTime = now;
+      packetsSentSinceLastLog = 0;
+    }
+
+    (session as any)._rtpSequence = sequenceNumber;
+    (session as any)._rtpTimestamp = timestamp;
+    (session as any)._lastTimeMicros = lastTimeMicros;
+    (session as any)._frameNumber = frameNumber;
+    (session as any)._packetsSentSinceLastLog = packetsSentSinceLastLog;
+    (session as any)._lastLogTime = lastLogTime;
   }
 
   /**

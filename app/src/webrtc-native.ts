@@ -2,7 +2,10 @@
  * WebRTC Native Manager
  *
  * Manages WebRTC sessions using the BaichuanWebRTCServer from the library.
- * Handles multiple cameras and sessions with automatic cleanup.
+ * Multiple browsers (phone + desktop) may view the same camera/profile at once:
+ * one BaichuanWebRTCServer per camera+profile fans out a single native Preview
+ * to N peer connections (library-side). Do not evict healthy sessions when a
+ * new client joins — that was the multi-device kick bug.
  */
 
 import {
@@ -54,28 +57,45 @@ interface WebRTCCameraSession {
   profile: "main" | "sub" | "ext";
   server: BaichuanWebRTCServer;
   sessionId: string;
+  serverKey: string;
+}
+
+interface SharedServerEntry {
+  server: BaichuanWebRTCServer;
+  cameraId: string;
+  profile: "main" | "sub" | "ext";
+  /** sessionIds attached to this server */
+  sessionIds: Set<string>;
+  enableIntercom: boolean;
 }
 
 // ============================================================================
 // State
 // ============================================================================
 
-// Map of sessionId -> camera session info
+/** sessionId → session meta */
 const activeSessions = new Map<string, WebRTCCameraSession>();
+
+/** `${cameraId}:${profile}` → shared BaichuanWebRTCServer */
+const sharedServers = new Map<string, SharedServerEntry>();
+
+function serverKey(cameraId: string, profile: string): string {
+  return `${cameraId}:${profile}`;
+}
 
 // ============================================================================
 // Public API
 // ============================================================================
 
 /**
- * Create a new WebRTC session for a camera
+ * Create a new WebRTC session for a camera.
+ * Concurrent viewers of the same camera/profile share one native Preview.
  */
 export async function createWebRTCSession(
   cameraId: string,
   profile: "main" | "sub" | "ext",
   enableIntercom: boolean = false,
 ): Promise<{ sessionId: string; offer: WebRTCOffer }> {
-  // Find camera by ID or sanitized name
   const config = getConfig();
   const camera = config.cameras.find(
     (c) => c.id === cameraId || sanitizeCameraName(c.name) === cameraId,
@@ -85,121 +105,131 @@ export async function createWebRTCSession(
     throw new Error(`Camera ${cameraId} not found`);
   }
 
-  // Check if camera is connected
   const camInfo = getCameraInfo(camera.id);
   if (!camInfo || camInfo.status !== "connected") {
     throw new Error(`Camera ${camera.id} is not connected`);
   }
 
-  // Get API connection
   const api = await getOrCreateApiConnection(camera.id);
   if (!api) {
     throw new Error(`Failed to get API connection for camera ${camera.id}`);
   }
 
+  const key = serverKey(camera.id, profile);
   logger.info(
-    `Creating WebRTC session for ${camera.name}/${profile} (intercom: ${enableIntercom})`,
+    `Creating WebRTC session for ${camera.name}/${profile} (intercom: ${enableIntercom}, sharedPeers=${sharedServers.get(key)?.sessionIds.size ?? 0})`,
   );
 
-  // Evict any existing session for the same (camera, profile). The camera
-  // rejects a second <Preview> on the same channel with response_code 430
-  // while the previous dedicated socket is still open, so we wait for the
-  // old session to finish closing before we ask for the next one. This
-  // happens whenever the browser re-mounts the player (React StrictMode in
-  // dev, or a rapid Stop→Start click) without an explicit close in between.
-  const stale = [...activeSessions.values()].filter(
-    (s) => s.cameraId === camera.id && s.profile === profile,
-  );
-  if (stale.length > 0) {
+  // Prune only *dead* sessions (ICE failed / closed) so reconnects from the
+  // same browser do not pile up, without kicking other healthy viewers.
+  const dead = [...activeSessions.values()].filter((s) => {
+    if (s.cameraId !== camera.id || s.profile !== profile) return false;
+    const info = s.server.getSession(s.sessionId);
+    if (!info) return true;
+    return info.state === "failed" || info.state === "disconnected";
+  });
+  if (dead.length > 0) {
     logger.info(
-      `Evicting ${stale.length} stale WebRTC session(s) for ${camera.name}/${profile} before opening a new one`,
+      `Cleaning ${dead.length} dead WebRTC session(s) for ${camera.name}/${profile}`,
     );
-    await Promise.allSettled(
-      stale.map(async (s) => {
-        try {
-          await s.server.closeSession(s.sessionId);
-        } catch (e) {
-          logger.warn(
-            `Eviction closeSession failed for ${s.sessionId}: ${(e as Error).message}`,
-          );
-        }
-        try {
-          await s.server.stop();
-        } catch { /* noop */ }
-        activeSessions.delete(s.sessionId);
-      }),
-    );
-    // Brief grace period so the underlying BaichuanClient dedicated socket
-    // fully releases inside the library's socket pool before we ask for it
-    // again. 200 ms is enough on the cameras we've tested.
-    await new Promise((r) => setTimeout(r, 200));
+    await Promise.allSettled(dead.map((s) => closeWebRTCSession(s.sessionId)));
   }
 
-  // Get channel from rtspChannel config or default to 0
-  const channel = camera.rtspChannel ?? 0;
+  let entry = sharedServers.get(key);
+  if (!entry) {
+    const channel = camera.rtspChannel ?? 0;
+    const settings = getSettings();
+    const icePortRange = parsePortRange(settings.webrtc?.icePortRange);
+    const iceAdditionalHostAddresses = parseCsv(
+      settings.webrtc?.iceAdditionalHostAddresses,
+    );
 
-  // Create WebRTC server for this session
-  const settings = getSettings();
-  const icePortRange = parsePortRange(settings.webrtc?.icePortRange);
-  const iceAdditionalHostAddresses = parseCsv(
-    settings.webrtc?.iceAdditionalHostAddresses,
-  );
+    // Prefer intercom-capable server so a later talk client can use the DC.
+    const server = new BaichuanWebRTCServer({
+      api,
+      channel,
+      profile,
+      enableIntercom: enableIntercom,
+      icePortRange,
+      iceAdditionalHostAddresses,
+      logger: (
+        level: "debug" | "info" | "warn" | "error",
+        message: string,
+      ) => {
+        logger[level](message);
+      },
+    });
 
-  const server = new BaichuanWebRTCServer({
-    api,
-    channel,
-    profile,
-    enableIntercom,
-    icePortRange,
-    iceAdditionalHostAddresses,
-    logger: (level: "debug" | "info" | "warn" | "error", message: string) => {
-      logger[level](message);
-    },
-  });
+    server.on("session-connected", ({ sessionId }: { sessionId: string }) => {
+      logger.info(`WebRTC session ${sessionId} connected`);
+    });
 
-  // Setup event handlers
-  server.on("session-connected", ({ sessionId }: { sessionId: string }) => {
-    logger.info(`WebRTC session ${sessionId} connected`);
-  });
+    server.on("session-closed", ({ sessionId }: { sessionId: string }) => {
+      logger.info(`WebRTC session ${sessionId} closed (library event)`);
+      // Library already closed the peer; drop our bookkeeping if still present.
+      const meta = activeSessions.get(sessionId);
+      if (meta) {
+        activeSessions.delete(sessionId);
+        const se = sharedServers.get(meta.serverKey);
+        se?.sessionIds.delete(sessionId);
+        if (se && se.sessionIds.size === 0) {
+          sharedServers.delete(meta.serverKey);
+          se.server.stop().catch(() => {});
+        }
+        const count = [...activeSessions.values()].filter(
+          (s) =>
+            s.cameraId === meta.cameraId && s.profile === meta.profile,
+        ).length;
+        emitStreamClientsChanged(
+          meta.cameraId,
+          "webrtc",
+          meta.profile,
+          count,
+        );
+      }
+    });
 
-  server.on("session-closed", ({ sessionId }: { sessionId: string }) => {
-    logger.info(`WebRTC session ${sessionId} closed`);
-    const session = activeSessions.get(sessionId);
-    activeSessions.delete(sessionId);
-    if (session) {
-      const count = [...activeSessions.values()].filter(
-        (s) => s.cameraId === session.cameraId && s.profile === session.profile,
-      ).length;
-      emitStreamClientsChanged(session.cameraId, "webrtc", session.profile, count);
-    }
-  });
+    server.on("intercom-started", ({ sessionId }: { sessionId: string }) => {
+      logger.info(`Intercom started for session ${sessionId}`);
+    });
 
-  server.on("intercom-started", ({ sessionId }: { sessionId: string }) => {
-    logger.info(`Intercom started for session ${sessionId}`);
-  });
+    server.on("intercom-stopped", ({ sessionId }: { sessionId: string }) => {
+      logger.info(`Intercom stopped for session ${sessionId}`);
+    });
 
-  server.on("intercom-stopped", ({ sessionId }: { sessionId: string }) => {
-    logger.info(`Intercom stopped for session ${sessionId}`);
-  });
+    entry = {
+      server,
+      cameraId: camera.id,
+      profile,
+      sessionIds: new Set(),
+      enableIntercom,
+    };
+    sharedServers.set(key, entry);
+    logger.info(
+      `Created shared WebRTC server for ${camera.name}/${profile}`,
+    );
+  } else if (enableIntercom && !entry.enableIntercom) {
+    logger.warn(
+      `Shared server for ${camera.name}/${profile} was created without intercom; talk may be unavailable for this peer until all viewers disconnect`,
+    );
+  }
 
-  // Create session
-  const { sessionId, offer } = await server.createSession();
+  const { sessionId, offer } = await entry.server.createSession();
 
-  // Store session info
+  entry.sessionIds.add(sessionId);
   activeSessions.set(sessionId, {
     cameraId: camera.id,
     profile,
-    server,
+    server: entry.server,
     sessionId,
+    serverKey: key,
   });
 
-  const count = [...activeSessions.values()].filter(
-    (s) => s.cameraId === camera.id && s.profile === profile,
-  ).length;
+  const count = entry.sessionIds.size;
   emitStreamClientsChanged(camera.id, "webrtc", profile, count);
 
   logger.info(
-    `WebRTC session ${sessionId} created for ${camera.name}/${profile}`,
+    `WebRTC session ${sessionId} created for ${camera.name}/${profile} (viewers=${count})`,
   );
 
   return { sessionId, offer };
@@ -245,9 +275,28 @@ export async function closeWebRTCSession(sessionId: string): Promise<void> {
     return;
   }
 
-  await session.server.closeSession(sessionId);
-  await session.server.stop();
   activeSessions.delete(sessionId);
+  const entry = sharedServers.get(session.serverKey);
+  entry?.sessionIds.delete(sessionId);
+
+  try {
+    await session.server.closeSession(sessionId);
+  } catch (e) {
+    logger.warn(
+      `closeSession failed for ${sessionId}: ${(e as Error).message}`,
+    );
+  }
+
+  // Tear down shared server only when no peers remain.
+  if (entry && entry.sessionIds.size === 0) {
+    sharedServers.delete(session.serverKey);
+    try {
+      await session.server.stop();
+    } catch {
+      /* noop */
+    }
+  }
+
   const count = [...activeSessions.values()].filter(
     (s) => s.cameraId === session.cameraId && s.profile === session.profile,
   ).length;
@@ -300,18 +349,19 @@ export async function stopAllWebRTCSessions(): Promise<void> {
   logger.info(`Stopping all WebRTC sessions (${activeSessions.size} active)`);
 
   const promises: Promise<void>[] = [];
-  for (const [sessionId, session] of activeSessions) {
+  for (const entry of sharedServers.values()) {
     promises.push(
-      session.server
+      entry.server
         .stop()
         .catch((err: unknown) =>
-          logger.error(`Error stopping session ${sessionId}: ${err}`),
+          logger.error(`Error stopping shared server: ${err}`),
         ),
     );
   }
 
   await Promise.all(promises);
   activeSessions.clear();
+  sharedServers.clear();
 
   logger.info("All WebRTC sessions stopped");
 }
